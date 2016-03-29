@@ -1,0 +1,229 @@
+---
+title: "Machine Learning Course Project"
+author: "AG"
+date: "March 27, 2016"
+output: html_document
+---
+
+## Background
+
+Exercise data was collected using accelerometers on the belt, forearm, arm, and dumbbell of 6 participants. They were told to perform barbell lifts correctly and incorrectly in 5 different ways. The purpose of this study was to determine whether data from the accelerometers could be used to predict whether the exercises were performed correctly or not.
+
+```{r setup, echo = FALSE, include = FALSE}
+# loads required packages
+library(reshape2)
+library(ggplot2)
+library(caret)
+library(plyr)
+library(dplyr)
+library(GGally)
+library(rpart)
+library(randomForest)
+# set wd
+setwd("//Andrew/C/Documents/Non-FORT/Machine Learning Course Project")
+knitr::opts_chunk$set(echo = TRUE,message = FALSE,warning = FALSE,fig.width = 8,fig.height = 4,comment = "")
+```
+
+
+First, the data is loaded. Fields with missing calculations, "#DIV/0!" are coded as NA.
+```{r load_data}
+training <- read.csv("input/pml-training.csv",
+                     header = TRUE,
+                     stringsAsFactors = FALSE,
+                     na.strings = c("NA","#DIV/0!"))
+testing <- read.csv("input/pml-testing.csv",
+                    header = TRUE,
+                    stringsAsFactors = FALSE,
+                    na.strings = c("NA","#DIV/0!"))
+```
+
+## Data Cleaning and Basic Preprocessing
+
+There are several columns which will not be useful for prediction. These ID columns contain data about when the data was collected and which subject was performing the exercise. Because we want to build a prediction model that will work regardless of who is performing the exercise or when they are performing it, I chose to exclude these columns and to not treat the data as time series data, despite there being a time-series element to it.
+```{r clean_data}
+drop.col <- c("X",
+              "user_name",
+             "raw_timestamp_part_1",
+             "raw_timestamp_part_2",
+             "cvtd_timestamp",
+             "new_window",
+             "num_window")
+
+training <- training[!(names(training) %in% drop.col)]
+#testing <- testing[!(names(testing) %in% drop.col)]
+```
+
+Several columns were also populated with NA values. If there was a single NA value in a column, I chose to exclude the column entirely.
+```{r clean_data2}
+training <- training[colSums(is.na(training)) == 0]
+#testing <- testing[colSums(is.na(training)) == 0]
+```
+
+```{r check_dims}
+dim(training)
+```
+
+The training set is significantly larger than the testing set. For this reason, I chose to split the training set into a sub-training, and sub-testing sets so that I could get an estimate of out-of-sample error without using the true test set.
+```{r cross_val, cache = TRUE}
+set.seed(5309)
+in.training.sub <- createDataPartition(y = training$classe,p = .25,list = FALSE)
+training.sub <- training[in.training.sub,]
+testing.sub <- training[-in.training.sub,]
+```
+
+In order to reduce the dimensionality of our data set, I also want to remove variables with little or no variation. If there is no variation in a variable--i.e., if most of the values are similar within a data set--it will not be a useful predictor *of variation* in the data.
+```{r remove_near_zero_var}
+classe.index <- match("classe",names(training.sub))
+nsv <- nearZeroVar(training.sub[,-classe.index],saveMetrics = TRUE)
+zero.var <- rownames(nsv)[nsv$zeroVar == TRUE]
+
+training.sub <- training.sub[!(names(training.sub) %in% zero.var)]
+testing.sub <- testing.sub[!(names(training.sub) %in% zero.var)]
+#testing <- testing[!(names(training.sub) %in% zero.var)]
+
+```
+
+The number of variables that have little to no variation and were removed is:
+```{r near_zero, echo = FALSE}
+length(zero.var)
+```
+
+## Exploratory Analysis
+
+The first exploratory analysis I want to perform is to check for correlated predictors, with the hopes that I can reduce the dimensionality of my data set. Reducing dimensionality may improve predictive performance, as well as making the model-building process computationally less expensive.
+```{r check_for_correlated_predictors, echo = FALSE}
+classe.index <- match("classe",names(training.sub))
+M <- abs(cor(training.sub[,-classe.index]))
+diag(M) <- 0
+correlated.predictors <- which(M > 0.9,arr.ind = TRUE)
+```
+
+The number of predictors with correlations with greater than 90% correlation with one another is:
+```{r correl_predict, echo = FALSE}
+nrow(correlated.predictors)
+```
+
+Plotting can help highlight the correlations. If the data has several variables that are highly correlated with each other, it may be a good candidate for principal component analysis.
+```{r plot_correl,fig.height = 4,fig.width = 6,echo = FALSE}
+# plot correlated columns against each other to verify that they are highly correlated
+data.correl <- data.frame(cor(training.sub[,unique(rownames(correlated.predictors))]))
+data.correl$var1 <- rownames(data.correl)
+data.correl <- melt(data.correl,id.vars = "var1",variable.name = "var2",value.name = "correlation")
+
+ggplot(data = data.correl,
+                   aes(x = var1,y = var2,size = abs(correlation),
+                       color = correlation)) + 
+    geom_point() +
+    theme(axis.text.x = element_text(angle = 90,hjust = 0))
+```
+
+
+## Model Exploration
+
+#### Initial Models
+I chose two types of models to explore: classification trees (rpart) and random forests (rf). I wanted to get an initial sense of how each performed, before I decided on preprocessing or cross-validation procedures.
+```{r model1, cache = TRUE}
+set.seed(5309)
+classe.index <- match("classe",names(training.sub))
+# basic classification tree
+modFit.rpart <- train(training.sub$classe ~ .,data = training.sub[,-classe.index],
+                      method = "rpart")
+
+# random forest
+modFit.rf <- train(training.sub$classe ~ .,data = training.sub[,-classe.index],
+                   method = "rf")
+```
+
+The accuracy of the final model for each approach was:
+```{r results1}
+max(modFit.rpart$results$Accuracy)
+max(modFit.rf$results$Accuracy)
+```
+
+
+#### Principal Component Analysis
+We want to find a new set of multivariate variables that are uncorrelated and explain as much variance as possible. Principal Component Analysis can reduce the dimensionality of our data and allow machine learning algorithms to operate on the *underlying* sources of variance in a data set.
+```{r model2, cache = TRUE}
+classe.index <- match("classe",names(training.sub))
+# basic classification tree
+modFit.rpart.pca <- train(training.sub$classe ~ .,data = training.sub[,-classe.index],
+                          method = "rpart",
+                          preProcess = "pca")
+
+# random forest
+modFit.rf.pca <- train(training.sub$classe ~ .,data = training.sub[,-classe.index],
+                       method = "rf",
+                       preProcess = "pca")
+```
+
+The accuracy of the final model for each approach was:
+```{r results2}
+max(modFit.rpart.pca$results$Accuracy)
+max(modFit.rf.pca$results$Accuracy)
+```
+Using Principal Component Analysis reduced the accuracy of both models.
+
+#### Centering and Scaling the data
+Another approach that can help reduce the effect of outliers in a data set is to center and scale the data by subtracting a variable's mean from itself, and dividing by the variable's standard deviation. This puts all variables on a normal scale.
+```{r model3, cache = TRUE}
+classe.index <- match("classe",names(training.sub))
+# basic classification tree
+modFit.rpart.cs <- train(training.sub$classe ~ .,data = training.sub[,-classe.index],
+                         method = "rpart",
+                         preProcess = c("center","scale"))
+
+# random forest
+modFit.rf.cs<- train(training.sub$classe ~ .,data = training.sub[,-classe.index],
+                     method = "rf",
+                     preProcess = c("center","scale"))
+```
+
+The accuracy of the final model for each approach was:
+```{r results3}
+max(modFit.rpart.cs$results$Accuracy)
+max(modFit.rf.cs$results$Accuracy)
+```
+There was no significant change in accuracy when the data was centered or scaled.
+
+
+#### Repeated K-Fold Cross-Validation
+The data is split into k-subsets. One subset is removed from the data set and the model is trained on the remaining subsets. The process is repeated, with the results of each sub-model being averaged together to produce the overall accuracy estimate.
+```{r model4, cache = TRUE}
+classe.index <- match("classe",names(training.sub))
+train.control <- trainControl(method = "repeatedcv",number = 10, repeats = 3)
+# basic classification tree
+modFit.rpart.kf <- train(training.sub$classe ~ .,data = training.sub[,-classe.index],
+                         trControl = train.control,
+                         method = "rpart")
+
+# random forest
+modFit.rf.kf <- train(training.sub$classe ~ .,data = training.sub[,-classe.index],
+                     trControl = train.control,
+                     method = "rf")
+```
+
+The accuracy of the final model for each approach was:
+```{r results4}
+max(modFit.rpart.kf$results$Accuracy)
+max(modFit.rf.kf$results$Accuracy)
+```
+
+Using K-fold cross-validation with 10 folds and 3 repeats was able to increase the model's accuracy to 97.44% in the subset of the training set. It caused a slight decrease in accuracy in the classification model. To verify that this is a valid model, we will test it on the partial test set that we built from the training set.
+
+```{r modelcomp, cache = TRUE}
+# random forest
+modFit.test.sub <- predict(modFit.rf.kf,testing.sub)
+print(confusionMatrix(modFit.test.sub,testing.sub$classe))
+```
+The results are validated for the partial test set that we built from the training set, as the model's accuracy is still 97.44%. Based on this artificial "out of sample" error, we estimate the true out-of-sample error to be 1 - .9744, or 2.56%.
+
+
+## Predicting with the Test Set
+
+We will now test our model with the true test set. These are the model's predictions:
+```{r true_test}
+print(predict(modFit.rf.kf,newdata = testing))
+```
+
+
+
